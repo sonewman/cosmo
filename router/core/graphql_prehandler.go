@@ -246,271 +246,280 @@ func (h *PreHandler) Handler(next http.Handler) http.Handler {
 			}
 		}
 
-		/**
-		 * Parse the operation
-		 */
-
-		if !traceOptions.ExcludeParseStats {
-			traceTimings.StartParse()
-		}
-
-		_, engineParseSpan := h.tracer.Start(r.Context(), "Operation - Parse",
-			trace.WithSpanKind(trace.SpanKindInternal),
-			trace.WithAttributes(commonAttributes...),
-			trace.WithAttributes(attributes...),
-		)
-
-		operationKit, err := h.operationProcessor.NewKit(body, files)
-		if err != nil {
-			finalErr = err
-
-			rtrace.AttachErrToSpan(engineParseSpan, err)
-			// Mark the root span of the router as failed, so we can easily identify failed requests
-			rtrace.AttachErrToSpan(routerSpan, err)
-
-			engineParseSpan.End()
-
-			writeOperationError(r, w, requestLogger, err)
-			h.releaseBodyReadBuffer(buf)
-			return
-		}
-		defer func() {
-			if operationKit != nil {
-				// before processing the request with the graphql_handler.go, we're calling Free() already on the operationKit and set the reference to nil
-				// this allows us to use less memory and free the resources as soon as possible
-				// however, we might return early in case of an error, which is why we're using defer here to make sure we're freeing the resources
-				operationKit.Free()
-			}
-		}()
-
-		err = operationKit.Parse(r.Context(), clientInfo)
-		if err != nil {
-			finalErr = err
-
-			rtrace.AttachErrToSpan(engineParseSpan, err)
-			// Mark the root span of the router as failed, so we can easily identify failed requests
-			rtrace.AttachErrToSpan(routerSpan, err)
-
-			engineParseSpan.End()
-
-			writeOperationError(r, w, requestLogger, err)
-			h.releaseBodyReadBuffer(buf)
-			return
-		}
-
-		engineParseSpan.End()
-
-		if !traceOptions.ExcludeParseStats {
-			traceTimings.EndParse()
-		}
-
+		// -- could this buffer be released here???
 		h.releaseBodyReadBuffer(buf)
 
-		if blockedErr := h.operationBlocker.OperationIsBlocked(operationKit.parsedOperation); blockedErr != nil {
-			// Mark the root span of the router as failed, so we can easily identify failed requests
-			rtrace.AttachErrToSpan(routerSpan, blockedErr)
+		err := ProcessRequest(w, r, body, func(w http.ResponseWriter, r *http.Request, body []byte) {
+			/**
+			 * Parse the operation
+			 */
 
-			writeRequestErrors(r, w, http.StatusOK, graphqlerrors.RequestErrorsFromError(blockedErr), requestLogger)
-			return
-		}
+			if !traceOptions.ExcludeParseStats {
+				traceTimings.StartParse()
+			}
 
-		// Set the router span name after we have the operation name
-		routerSpan.SetName(GetSpanName(operationKit.parsedOperation.Request.OperationName, operationKit.parsedOperation.Type))
-
-		attributes = []attribute.KeyValue{
-			otel.WgOperationName.String(operationKit.parsedOperation.Request.OperationName),
-			otel.WgOperationType.String(operationKit.parsedOperation.Type),
-		}
-		if operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery != nil &&
-			operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash != "" {
-			attributes = append(attributes, otel.WgOperationPersistedID.String(operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash))
-		}
-
-		routerSpan.SetAttributes(attributes...)
-		metrics.AddAttributes(attributes...)
-
-		/**
-		* Normalize the operation
-		 */
-
-		if !traceOptions.ExcludeNormalizeStats {
-			traceTimings.StartNormalize()
-		}
-
-		_, engineNormalizeSpan := h.tracer.Start(r.Context(), "Operation - Normalize",
-			trace.WithSpanKind(trace.SpanKindInternal),
-			trace.WithAttributes(commonAttributes...),
-			trace.WithAttributes(attributes...),
-		)
-
-		err = operationKit.Normalize()
-		if err != nil {
-			finalErr = err
-
-			rtrace.AttachErrToSpan(engineNormalizeSpan, err)
-			// Mark the root span of the router as failed, so we can easily identify failed requests
-			rtrace.AttachErrToSpan(routerSpan, err)
-
-			engineNormalizeSpan.End()
-
-			writeOperationError(r, w, requestLogger, err)
-			return
-		}
-
-		if operationKit.parsedOperation.IsPersistedOperation {
-			engineNormalizeSpan.SetAttributes(otel.WgEnginePersistedOperationCacheHit.Bool(operationKit.parsedOperation.PersistedOperationCacheHit))
-		}
-
-		engineNormalizeSpan.End()
-
-		if !traceOptions.ExcludeNormalizeStats {
-			traceTimings.EndNormalize()
-		}
-
-		if h.traceExportVariables {
-			// At this stage the variables are normalized
-			routerSpan.SetAttributes(otel.WgOperationVariables.String(string(operationKit.parsedOperation.Request.Variables)))
-		}
-
-		attributes = []attribute.KeyValue{
-			otel.WgOperationHash.String(strconv.FormatUint(operationKit.parsedOperation.ID, 10)),
-		}
-
-		// Set the normalized operation as soon as we have it
-		routerSpan.SetAttributes(otel.WgOperationContent.String(operationKit.parsedOperation.NormalizedRepresentation))
-		routerSpan.SetAttributes(attributes...)
-
-		metrics.AddAttributes(attributes...)
-
-		/**
-		* Validate the operation
-		 */
-
-		if !traceOptions.ExcludeValidateStats {
-			traceTimings.StartValidate()
-		}
-
-		_, engineValidateSpan := h.tracer.Start(r.Context(), "Operation - Validate",
-			trace.WithSpanKind(trace.SpanKindInternal),
-			trace.WithAttributes(commonAttributes...),
-		)
-		err = operationKit.Validate()
-		if err != nil {
-			finalErr = err
-
-			rtrace.AttachErrToSpan(engineValidateSpan, err)
-			// Mark the root span of the router as failed, so we can easily identify failed requests
-			rtrace.AttachErrToSpan(routerSpan, err)
-
-			engineValidateSpan.End()
-
-			writeOperationError(r, w, requestLogger, err)
-			return
-		}
-
-		engineValidateSpan.End()
-
-		if !traceOptions.ExcludeValidateStats {
-			traceTimings.EndValidate()
-		}
-
-		/**
-		* Plan the operation
-		 */
-
-		// If the request has a query parameter wg_trace=true we skip the cache
-		// and always plan the operation
-		// this allows us to "write" to the plan
-		if !traceOptions.ExcludePlannerStats {
-			traceTimings.StartPlanning()
-		}
-
-		_, enginePlanSpan := h.tracer.Start(r.Context(), "Operation - Plan",
-			trace.WithSpanKind(trace.SpanKindInternal),
-			trace.WithAttributes(otel.WgEngineRequestTracingEnabled.Bool(traceOptions.Enable)),
-			trace.WithAttributes(commonAttributes...),
-		)
-
-		opContext, err := h.planner.Plan(operationKit.parsedOperation, clientInfo, OperationProtocolHTTP, traceOptions)
-		if err != nil {
-			finalErr = err
-
-			rtrace.AttachErrToSpan(enginePlanSpan, err)
-			// Mark the root span of the router as failed, so we can easily identify failed requests
-			rtrace.AttachErrToSpan(routerSpan, err)
-
-			enginePlanSpan.End()
-
-			requestLogger.Error("failed to plan operation", zap.Error(err))
-			writeOperationError(r, w, requestLogger, err)
-			return
-		}
-
-		enginePlanSpan.SetAttributes(otel.WgEnginePlanCacheHit.Bool(opContext.planCacheHit))
-
-		enginePlanSpan.End()
-
-		if !traceOptions.ExcludePlannerStats {
-			traceTimings.EndPlanning()
-		}
-
-		// If we have authenticators, we try to authenticate the request
-		if len(h.accessController.authenticators) > 0 {
-			_, authenticateSpan := h.tracer.Start(r.Context(), "Authenticate",
-				trace.WithSpanKind(trace.SpanKindServer),
+			_, engineParseSpan := h.tracer.Start(r.Context(), "Operation - Parse",
+				trace.WithSpanKind(trace.SpanKindInternal),
 				trace.WithAttributes(commonAttributes...),
+				trace.WithAttributes(attributes...),
 			)
 
-			validatedReq, err := h.accessController.Access(w, r)
+			operationKit, err := h.operationProcessor.NewKit(body, files)
 			if err != nil {
 				finalErr = err
-				requestLogger.Error("failed to authenticate request", zap.Error(err))
 
+				rtrace.AttachErrToSpan(engineParseSpan, err)
 				// Mark the root span of the router as failed, so we can easily identify failed requests
 				rtrace.AttachErrToSpan(routerSpan, err)
-				rtrace.AttachErrToSpan(authenticateSpan, err)
 
-				authenticateSpan.End()
+				engineParseSpan.End()
 
-				writeRequestErrors(r, w, http.StatusUnauthorized, graphqlerrors.RequestErrorsFromError(err), requestLogger)
+				writeOperationError(r, w, requestLogger, err)
+				// h.releaseBodyReadBuffer(buf) -- if released earlier?
+				return
+			}
+			defer func() {
+				if operationKit != nil {
+					// before processing the request with the graphql_handler.go, we're calling Free() already on the operationKit and set the reference to nil
+					// this allows us to use less memory and free the resources as soon as possible
+					// however, we might return early in case of an error, which is why we're using defer here to make sure we're freeing the resources
+					operationKit.Free()
+				}
+			}()
+
+			err = operationKit.Parse(r.Context(), clientInfo)
+			if err != nil {
+				finalErr = err
+
+				rtrace.AttachErrToSpan(engineParseSpan, err)
+				// Mark the root span of the router as failed, so we can easily identify failed requests
+				rtrace.AttachErrToSpan(routerSpan, err)
+
+				engineParseSpan.End()
+
+				writeOperationError(r, w, requestLogger, err)
+				// h.releaseBodyReadBuffer(buf) -- if released earlier?
 				return
 			}
 
-			authenticateSpan.End()
+			engineParseSpan.End()
 
-			r = validatedReq
-		}
+			if !traceOptions.ExcludeParseStats {
+				traceTimings.EndParse()
+			}
 
-		// Free the operation kit after we're done with it
-		// We don't need to hold onto it while processing the operation
-		operationKit.Free()
-		operationKit = nil
+			// h.releaseBodyReadBuffer(buf) -- if released earlier?
 
-		art.SetRequestTracingStats(r.Context(), traceOptions, traceTimings)
+			if blockedErr := h.operationBlocker.OperationIsBlocked(operationKit.parsedOperation); blockedErr != nil {
+				// Mark the root span of the router as failed, so we can easily identify failed requests
+				rtrace.AttachErrToSpan(routerSpan, blockedErr)
 
-		requestContext := buildRequestContext(w, r, opContext, requestLogger)
-		metrics.AddOperationContext(opContext)
+				writeRequestErrors(r, w, http.StatusOK, graphqlerrors.RequestErrorsFromError(blockedErr), requestLogger)
+				return
+			}
 
-		ctxWithRequest := withRequestContext(r.Context(), requestContext)
-		ctxWithOperation := withOperationContext(ctxWithRequest, opContext)
-		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			// Set the router span name after we have the operation name
+			routerSpan.SetName(GetSpanName(operationKit.parsedOperation.Request.OperationName, operationKit.parsedOperation.Type))
 
-		newReq := r.WithContext(ctxWithOperation)
+			attributes = []attribute.KeyValue{
+				otel.WgOperationName.String(operationKit.parsedOperation.Request.OperationName),
+				otel.WgOperationType.String(operationKit.parsedOperation.Type),
+			}
+			if operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery != nil &&
+				operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash != "" {
+				attributes = append(attributes, otel.WgOperationPersistedID.String(operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash))
+			}
 
-		// Call the final handler that resolves the operation
-		// and enrich the context to make it available in the request context as well for metrics etc.
-		next.ServeHTTP(ww, newReq)
+			routerSpan.SetAttributes(attributes...)
+			metrics.AddAttributes(attributes...)
 
-		statusCode = ww.Status()
-		writtenBytes = ww.BytesWritten()
+			/**
+			* Normalize the operation
+			 */
 
-		// Evaluate the request after the request has been handled by the engine handler
-		finalErr = requestContext.error
+			if !traceOptions.ExcludeNormalizeStats {
+				traceTimings.StartNormalize()
+			}
 
-		// Mark the root span of the router as failed, so we can easily identify failed requests
-		routerSpan = trace.SpanFromContext(newReq.Context())
-		if finalErr != nil {
-			rtrace.AttachErrToSpan(routerSpan, finalErr)
+			_, engineNormalizeSpan := h.tracer.Start(r.Context(), "Operation - Normalize",
+				trace.WithSpanKind(trace.SpanKindInternal),
+				trace.WithAttributes(commonAttributes...),
+				trace.WithAttributes(attributes...),
+			)
+
+			err = operationKit.Normalize()
+			if err != nil {
+				finalErr = err
+
+				rtrace.AttachErrToSpan(engineNormalizeSpan, err)
+				// Mark the root span of the router as failed, so we can easily identify failed requests
+				rtrace.AttachErrToSpan(routerSpan, err)
+
+				engineNormalizeSpan.End()
+
+				writeOperationError(r, w, requestLogger, err)
+				return
+			}
+
+			if operationKit.parsedOperation.IsPersistedOperation {
+				engineNormalizeSpan.SetAttributes(otel.WgEnginePersistedOperationCacheHit.Bool(operationKit.parsedOperation.PersistedOperationCacheHit))
+			}
+
+			engineNormalizeSpan.End()
+
+			if !traceOptions.ExcludeNormalizeStats {
+				traceTimings.EndNormalize()
+			}
+
+			if h.traceExportVariables {
+				// At this stage the variables are normalized
+				routerSpan.SetAttributes(otel.WgOperationVariables.String(string(operationKit.parsedOperation.Request.Variables)))
+			}
+
+			attributes = []attribute.KeyValue{
+				otel.WgOperationHash.String(strconv.FormatUint(operationKit.parsedOperation.ID, 10)),
+			}
+
+			// Set the normalized operation as soon as we have it
+			routerSpan.SetAttributes(otel.WgOperationContent.String(operationKit.parsedOperation.NormalizedRepresentation))
+			routerSpan.SetAttributes(attributes...)
+
+			metrics.AddAttributes(attributes...)
+
+			/**
+			* Validate the operation
+			 */
+
+			if !traceOptions.ExcludeValidateStats {
+				traceTimings.StartValidate()
+			}
+
+			_, engineValidateSpan := h.tracer.Start(r.Context(), "Operation - Validate",
+				trace.WithSpanKind(trace.SpanKindInternal),
+				trace.WithAttributes(commonAttributes...),
+			)
+			err = operationKit.Validate()
+			if err != nil {
+				finalErr = err
+
+				rtrace.AttachErrToSpan(engineValidateSpan, err)
+				// Mark the root span of the router as failed, so we can easily identify failed requests
+				rtrace.AttachErrToSpan(routerSpan, err)
+
+				engineValidateSpan.End()
+
+				writeOperationError(r, w, requestLogger, err)
+				return
+			}
+
+			engineValidateSpan.End()
+
+			if !traceOptions.ExcludeValidateStats {
+				traceTimings.EndValidate()
+			}
+
+			/**
+			* Plan the operation
+			 */
+
+			// If the request has a query parameter wg_trace=true we skip the cache
+			// and always plan the operation
+			// this allows us to "write" to the plan
+			if !traceOptions.ExcludePlannerStats {
+				traceTimings.StartPlanning()
+			}
+
+			_, enginePlanSpan := h.tracer.Start(r.Context(), "Operation - Plan",
+				trace.WithSpanKind(trace.SpanKindInternal),
+				trace.WithAttributes(otel.WgEngineRequestTracingEnabled.Bool(traceOptions.Enable)),
+				trace.WithAttributes(commonAttributes...),
+			)
+
+			opContext, err := h.planner.Plan(operationKit.parsedOperation, clientInfo, OperationProtocolHTTP, traceOptions)
+			if err != nil {
+				finalErr = err
+
+				rtrace.AttachErrToSpan(enginePlanSpan, err)
+				// Mark the root span of the router as failed, so we can easily identify failed requests
+				rtrace.AttachErrToSpan(routerSpan, err)
+
+				enginePlanSpan.End()
+
+				requestLogger.Error("failed to plan operation", zap.Error(err))
+				writeOperationError(r, w, requestLogger, err)
+				return
+			}
+
+			enginePlanSpan.SetAttributes(otel.WgEnginePlanCacheHit.Bool(opContext.planCacheHit))
+
+			enginePlanSpan.End()
+
+			if !traceOptions.ExcludePlannerStats {
+				traceTimings.EndPlanning()
+			}
+
+			// If we have authenticators, we try to authenticate the request
+			if len(h.accessController.authenticators) > 0 {
+				_, authenticateSpan := h.tracer.Start(r.Context(), "Authenticate",
+					trace.WithSpanKind(trace.SpanKindServer),
+					trace.WithAttributes(commonAttributes...),
+				)
+
+				validatedReq, err := h.accessController.Access(w, r)
+				if err != nil {
+					finalErr = err
+					requestLogger.Error("failed to authenticate request", zap.Error(err))
+
+					// Mark the root span of the router as failed, so we can easily identify failed requests
+					rtrace.AttachErrToSpan(routerSpan, err)
+					rtrace.AttachErrToSpan(authenticateSpan, err)
+
+					authenticateSpan.End()
+
+					writeRequestErrors(r, w, http.StatusUnauthorized, graphqlerrors.RequestErrorsFromError(err), requestLogger)
+					return
+				}
+
+				authenticateSpan.End()
+
+				r = validatedReq
+			}
+
+			// Free the operation kit after we're done with it
+			// We don't need to hold onto it while processing the operation
+			operationKit.Free()
+			operationKit = nil
+
+			art.SetRequestTracingStats(r.Context(), traceOptions, traceTimings)
+
+			requestContext := buildRequestContext(w, r, opContext, requestLogger)
+			metrics.AddOperationContext(opContext)
+
+			ctxWithRequest := withRequestContext(r.Context(), requestContext)
+			ctxWithOperation := withOperationContext(ctxWithRequest, opContext)
+			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+
+			newReq := r.WithContext(ctxWithOperation)
+
+			// Call the final handler that resolves the operation
+			// and enrich the context to make it available in the request context as well for metrics etc.
+			next.ServeHTTP(ww, newReq)
+
+			statusCode = ww.Status()
+			writtenBytes = ww.BytesWritten()
+
+			// Evaluate the request after the request has been handled by the engine handler
+			finalErr = requestContext.error
+
+			// Mark the root span of the router as failed, so we can easily identify failed requests
+			routerSpan = trace.SpanFromContext(newReq.Context())
+			if finalErr != nil {
+				rtrace.AttachErrToSpan(routerSpan, finalErr)
+			}
+		})
+
+		if err != nil {
+			writeOperationError(r, w, requestLogger, err)
 		}
 	})
 }
